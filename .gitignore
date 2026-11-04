@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Raw datasets and frozen test data
+data/
+datasets/
+*.parquet
+*.zip
+*test_transitions.csv
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+
+# Large generated files
+*.pkl
+*.joblib
+# Generated experiment outputs (review and selectively publish later)
+outputs/
+
+# Derived data files
+pilot_transitions.csv
+processed_events.csv
+
+# Execution logs
+audit_run.txt
+pipeline_run.txt
+profile_run.txt
+val_*.txt
+
+# Python cache
+__pycache__/
+
+# Original KuaiRand repository files
+LICENSE
+figs/
+KUairand_ORIGINAL_README.md
