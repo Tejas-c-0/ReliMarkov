@@ -129,6 +129,18 @@ def assert_query_alignment(left_query_ids, right_query_ids):
         raise AssertionError("Prediction query IDs or their order differ.")
 
 
+def assert_no_validation_cutoff_events(frame):
+    if "time_ms" not in frame:
+        raise KeyError("Loaded event frame is missing time_ms.")
+    time_series = pd.to_numeric(frame["time_ms"], errors="coerce")
+    post_cutoff = time_series[time_series >= (VAL_END_MS + 1)]
+    if not post_cutoff.empty:
+        raise AssertionError(
+            "Loaded event rows fall on or after the validation cutoff: "
+            f"{len(post_cutoff)} rows >= {VAL_END_MS + 1}."
+        )
+
+
 def rank_candidates(candidates, score_function, video_popularity):
     scores = {video_id: score_function(video_id) for video_id in candidates}
     return sorted(
@@ -274,20 +286,31 @@ def _cluster_bootstrap(records, metrics, metric_type, rounds=BOOTSTRAP_ROUNDS, s
 class Phase4ExperimentEngine:
     """Training-only tables and validation queries with no test-split reads."""
 
-    def __init__(self, gap):
+    def __init__(self, gap, data_dir=DATA_DIR):
         if gap not in GAPS:
             raise ValueError(f"Unsupported gap: {gap}")
         self.gap = gap
         self.tag = f"{gap}min"
-        self.train_df = pd.read_parquet(SPLIT_DIR / f"train_transitions_{self.tag}.parquet")
-        self.val_df = pd.read_parquet(SPLIT_DIR / f"val_transitions_{self.tag}.parquet")
+        self.data_dir = Path(data_dir)
+        self.split_dir = self.data_dir / "splits"
+        self.eb_dir = self.data_dir.parent / "outputs" / "eb_params"
+        self.log_files = (
+            self.data_dir / "log_standard_4_08_to_4_21_1k.csv",
+            self.data_dir / "log_standard_4_22_to_5_08_1k.csv",
+        )
+        self.train_df = pd.read_parquet(
+            self.split_dir / f"train_transitions_{self.tag}.parquet"
+        )
+        self.val_df = pd.read_parquet(
+            self.split_dir / f"val_transitions_{self.tag}.parquet"
+        )
         self.catalogue = set(
-            json.loads((SPLIT_DIR / f"train_catalogue_{self.tag}.json").read_text())
+            json.loads((self.split_dir / f"train_catalogue_{self.tag}.json").read_text())
         )
         self.video_popularity = {
             int(video_id): int(count)
             for video_id, count in json.loads(
-                (SPLIT_DIR / f"video_popularity_{self.tag}.json").read_text()
+                (self.split_dir / f"video_popularity_{self.tag}.json").read_text()
             ).items()
         }
         self.global_top_100 = tuple(
@@ -301,7 +324,7 @@ class Phase4ExperimentEngine:
             for video_id, count in self.video_popularity.items()
         }
         author_video_map = json.loads(
-            (SPLIT_DIR / f"author_video_map_{self.tag}.json").read_text()
+            (self.split_dir / f"author_video_map_{self.tag}.json").read_text()
         )
         self.video_to_author = {
             int(video_id): int(author_id)
@@ -313,7 +336,9 @@ class Phase4ExperimentEngine:
             for video_id in self.catalogue
             if video_id in self.video_to_author
         }
-        eb_data = json.loads((EB_DIR / f"eb_hyperparams_{self.tag}.json").read_text())
+        eb_data = json.loads(
+            (self.eb_dir / f"eb_hyperparams_{self.tag}.json").read_text()
+        )
         self.alpha_eb_video = float(eb_data["video_eb"]["alpha0"])
 
         self.required_event_keys = self._required_event_keys()
@@ -342,12 +367,13 @@ class Phase4ExperimentEngine:
         duplicate_event_keys = 0
         file_diagnostics = []
 
-        for log_path in LOG_FILES:
+        for log_path in self.log_files:
             row_mask, selected_row_count = scan_training_validation_rows(log_path)
             parsed_row_count = 0
             matched_row_count = 0
             for chunk in _read_filtered_event_chunks(log_path, row_mask):
                 parsed_row_count += len(chunk)
+                assert_no_validation_cutoff_events(chunk)
                 times = pd.to_numeric(chunk["time_ms"], errors="coerce")
                 dataset_a_click = chunk["tab"].eq(1) & chunk["is_click"].eq(1)
                 eligible = chunk.loc[
@@ -388,6 +414,9 @@ class Phase4ExperimentEngine:
         return event_records, {
             "files": file_diagnostics,
             "duplicate_matched_event_keys": duplicate_event_keys,
+            "maximum_loaded_event_time_ms": (
+                max(key[2] for key in event_records) if event_records else None
+            ),
         }
 
     def _event_weight(self, key, treatment):
@@ -742,10 +771,10 @@ def _metric_rows(gap, engine, records_by_model):
     return rows
 
 
-def run_gap(gap, run_dir):
+def run_gap(gap, run_dir, data_dir=DATA_DIR):
     started = time.perf_counter()
     process = psutil.Process()
-    engine = Phase4ExperimentEngine(gap)
+    engine = Phase4ExperimentEngine(gap, data_dir=data_dir)
     predictions, records_by_model, equality_diagnostics = _evaluate_queries(engine, process)
 
     metrics_path = run_dir / f"validation_metrics_{gap}min.csv"
@@ -778,6 +807,9 @@ def run_gap(gap, run_dir):
         "models": list(MODEL_NAMES),
         "lookup_diagnostics": engine.lookup_diagnostics,
         "timestamp_only_log_scans": engine.log_scan_diagnostics,
+        "maximum_loaded_event_time_ms": engine.log_scan_diagnostics[
+            "maximum_loaded_event_time_ms"
+        ],
         "standard_integer_count_eb_alpha0": engine.alpha_eb_video,
         "training_mean_W4": engine.mean_w4,
         "peak_working_set_mb": equality_diagnostics["peak_working_set_mb"],
@@ -801,19 +833,40 @@ def run_gap(gap, run_dir):
     }
 
 
-def run_phase4():
-    RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+def run_phase4(data_dir=DATA_DIR, out_dir=RESULTS_ROOT):
+    data_dir = Path(data_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("run_%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000_000:09d}"
-    run_dir = RESULTS_ROOT / run_id
+    run_dir = out_dir / run_id
     if run_dir.exists():
         raise FileExistsError(f"Refusing to overwrite existing run directory: {run_dir}")
     run_dir.mkdir()
-    gap_results = [run_gap(gap, run_dir) for gap in GAPS]
-    metadata = {"run_id": run_id, "gaps": gap_results}
+    gap_results = [run_gap(gap, run_dir, data_dir=data_dir) for gap in GAPS]
+    metadata = {
+        "run_id": run_id,
+        "configuration": {
+            "gaps_minutes": list(GAPS),
+            "models": list(MODEL_NAMES),
+            "treatments": list(TREATMENTS),
+            "candidate_policy": "training successors union global Top-100 by training popularity",
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "bootstrap_resamples": BOOTSTRAP_ROUNDS,
+        },
+        "gaps": gap_results,
+    }
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
-    print(json.dumps({"run_directory": str(run_dir), **metadata}, indent=2))
+    console_text = json.dumps({"run_directory": run_dir.name, **metadata}, indent=2)
+    (run_dir / "console.log").write_text(console_text + "\n", encoding="utf-8")
+    print(console_text)
     return run_dir
 
 
 if __name__ == "__main__":
-    run_phase4()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run validation-only Phase 4 evaluation.")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--out-dir", type=Path, default=RESULTS_ROOT)
+    args = parser.parse_args()
+    run_phase4(data_dir=args.data_dir, out_dir=args.out_dir)
